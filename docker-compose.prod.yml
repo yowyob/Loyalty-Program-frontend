@@ -1,0 +1,28 @@
+services:
+  loyalty-frontend:
+    image: "${APP_IMAGE:?APP_IMAGE requis}"
+    container_name: loyalty-frontend
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      NODE_ENV: "production"
+      PORT: "3000"
+      NEXT_PUBLIC_API_URL: "https://loyalty.yowyob.com/loyalty-api"
+    healthcheck:
+      test: ["CMD-SHELL","wget -qO- http://127.0.0.1:3000/ >/dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 15
+      start_period: 45s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.loyalty-front.rule=Host(`loyalty.yowyob.com`)"
+      - "traefik.http.routers.loyalty-front.entrypoints=websecure"
+      - "traefik.http.routers.loyalty-front.tls=true"
+      - "traefik.http.routers.loyalty-front.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.loyalty-front.priority=10"
+      - "traefik.http.services.loyalty-front.loadbalancer.server.port=3000"
+      - "traefik.docker.network=yowyob"
+    networks: [yowyob]
+networks:
+  yowyob: { external: true, name: yowyob }
