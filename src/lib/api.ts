@@ -9,29 +9,33 @@ const BASE = "/backend";
 
 // ─── Utilitaires de base ────────────────────────────────────────────────────
 
+/**
+ * Le backend traite un JWT admin (claim organization_id) et une clé API tenant
+ * (X-Api-Key) comme deux credentials équivalents, résolus tous deux vers
+ * ROLE_TENANT_ADMIN sur le tenant appelant. On envoie le JWT s'il est présent
+ * (login email/mot de passe), sinon la clé API (portail développeur "coller sa clé").
+ */
 function getAuthHeaders(): HeadersInit {
     const token =
         typeof window !== "undefined"
             ? sessionStorage.getItem("loyalty_jwt_token")
             : null;
-    return {
-        "Content-Type": "application/json",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    };
-}
-
-/**
- * Auth pour le portail développeur : une clé API tenant (X-Api-Key), distincte
- * du JWT admin (loyalty_jwt_token) utilisé par le portail /portal.
- */
-function getDevApiKeyHeaders(): HeadersInit {
-    const key =
+    const apiKey =
         typeof window !== "undefined"
             ? sessionStorage.getItem("loyalty_dev_api_key")
             : null;
+    const organizationId =
+        typeof window !== "undefined"
+            ? sessionStorage.getItem("loyalty_organization_id")
+            : null;
     return {
         "Content-Type": "application/json",
-        ...(key ? { "X-Api-Key": key } : {}),
+        ...(token
+            ? { Authorization: `Bearer ${token}` }
+            : apiKey
+                ? { "X-Api-Key": apiKey }
+                : {}),
+        ...(organizationId ? { "X-Organization-Id": organizationId } : {}),
     };
 }
 
@@ -53,8 +57,10 @@ async function requestWithHeaders<T>(
         throw new Error(`[${res.status}] ${text}`);
     }
 
+    // Certaines réponses (ex: Spring Boot Actuator) utilisent un content-type
+    // "application/vnd.spring-boot.actuator.v3+json" et non "application/json" strict.
     const contentType = res.headers.get("content-type");
-    if (contentType?.includes("application/json")) {
+    if (contentType?.includes("json")) {
         return res.json();
     }
     return null as T;
@@ -68,15 +74,28 @@ const post = <T>(path: string, body: unknown, headers?: HeadersInit) =>
     request<T>("POST", path, body, headers);
 const patch = <T>(path: string, body?: unknown) =>
     request<T>("PATCH", path, body);
+
+/**
+ * Console plateforme (/api/v1/admin/platform/**) : credential distinct, non
+ * rattaché à un tenant (secret statique X-Platform-Admin-Key), donc pas
+ * mélangé avec getAuthHeaders (JWT/clé API tenant).
+ */
+function getPlatformAdminHeaders(): HeadersInit {
+    const key =
+        typeof window !== "undefined"
+            ? sessionStorage.getItem("loyalty_platform_admin_key")
+            : null;
+    return {
+        "Content-Type": "application/json",
+        ...(key ? { "X-Platform-Admin-Key": key } : {}),
+    };
+}
+
+const getPlatform = <T>(path: string) =>
+    requestWithHeaders<T>(getPlatformAdminHeaders, "GET", path);
 const put = <T>(path: string, body?: unknown) =>
     request<T>("PUT", path, body);
-
-// Variantes authentifiées par clé API (portail développeur, /developer/*)
-const requestDev = <T>(method: string, path: string, body?: unknown) =>
-    requestWithHeaders<T>(getDevApiKeyHeaders, method, path, body);
-const getDev = <T>(path: string) => requestDev<T>("GET", path);
-const postDev = <T>(path: string, body: unknown) => requestDev<T>("POST", path, body);
-const patchDev = <T>(path: string, body?: unknown) => requestDev<T>("PATCH", path, body);
+const del = <T>(path: string) => request<T>("DELETE", path);
 
 // ─── Types partagés ─────────────────────────────────────────────────────────
 
@@ -162,7 +181,7 @@ export interface RuleResponse {
     conditions: RuleConditionDto[];
     effects: RuleEffectDto[];
     priority: number;
-    status: "ACTIVE" | "INACTIVE" | "DRAFT";
+    status: "DRAFT" | "ACTIVE" | "SUSPENDED" | "ARCHIVED";
     validFrom: string;
     validUntil: string | null;
     tenantId: string;
@@ -183,8 +202,10 @@ export interface CreateRuleRequest {
 export interface IncomingEventRequest {
     eventType: string;
     memberId: string;
-    amount?: number;
-    metadata?: Record<string, string>;
+    /** ISO-8601 ; obligatoire côté backend (IncomingEventRequest.occurredAt est @NotNull). */
+    occurredAt: string;
+    /** Sac libre de données métier, ex. { amount: 49.90 } — pas de champs top-level comme "amount". */
+    payload?: Record<string, unknown>;
 }
 
 export interface EventProcessingResponse {
@@ -351,6 +372,10 @@ export const rulesApi = {
     /** PATCH /api/v1/admin/rules/{id}/activate — Activer une règle */
     activateRule: (ruleId: string) =>
         patch<RuleResponse>(`/api/v1/admin/rules/${ruleId}/activate`),
+
+    /** PATCH /api/v1/admin/rules/{id}/archive — Archiver (désactiver) une règle */
+    archiveRule: (ruleId: string) =>
+        patch<RuleResponse>(`/api/v1/admin/rules/${ruleId}/archive`),
 };
 
 // ─── API Événements ──────────────────────────────────────────────────────────
@@ -551,15 +576,40 @@ export const subscriptionApi = {
     cancel: () => request<void>("DELETE", "/api/v1/subscriptions/me"),
 };
 
+// ─── API Console Plateforme (cross-tenant, secret statique) ──────────────────
+
+export interface PlatformTenantResponse {
+    tenantId: string;
+    tenantName: string;
+    subscriptionStatus: string;
+    planCode: string;
+    planName: string;
+    trialEndDate: string | null;
+    currentPeriodEnd: string | null;
+    totalPaidAmount: number;
+    currency: string;
+}
+
+export const platformApi = {
+    /** GET /api/v1/admin/platform/tenants — Organisations abonnées au service loyalty */
+    listTenants: () => getPlatform<PlatformTenantResponse[]>("/api/v1/admin/platform/tenants"),
+};
+
 // ─── API Auth (Portail Admin) ─────────────────────────────────────────────────
 
 export interface LoginRequest {
     email: string;
     password: string;
+    /** Organisation KernelCore à sélectionner ; requis si l'acteur en a plusieurs (voir 400 ORGANIZATION_SELECTION_REQUIRED). */
+    organizationId?: string;
 }
 
 export interface LoginResponse {
     token: string;
+    /** À renvoyer sur chaque appel suivant via le header X-Organization-Id. */
+    organizationId: string;
+    organizationCode: string;
+    organizationName: string;
 }
 
 export const authApi = {
@@ -567,60 +617,50 @@ export const authApi = {
     login: (data: LoginRequest) => post<LoginResponse>("/api/v1/auth/login", data),
 };
 
-// ─── API Clés API (Developer Portal — authentifié par clé API) ───────────────
+// ─── API Clés API (auto-service tenant — JWT ou clé API) ─────────────────────
 
 export const apiKeyApi = {
     /** GET /api/v1/admin/api-keys — Lister les clés API du tenant */
-    list: () => getDev<ApiKeyResponse[]>("/api/v1/admin/api-keys"),
+    list: () => get<ApiKeyResponse[]>("/api/v1/admin/api-keys"),
 
     /** POST /api/v1/admin/api-keys — Créer une clé API (rawKey affichée une seule fois) */
     create: (data: CreateApiKeyRequest) =>
-        postDev<ApiKeyResponse>("/api/v1/admin/api-keys", data),
+        post<ApiKeyResponse>("/api/v1/admin/api-keys", data),
 
     /** DELETE /api/v1/admin/api-keys/{id} — Révoquer une clé API */
-    revoke: (id: string) =>
-        requestDev<void>("DELETE", `/api/v1/admin/api-keys/${id}`),
+    revoke: (id: string) => del<void>(`/api/v1/admin/api-keys/${id}`),
 };
 
-// ─── API Webhooks (Developer Portal — authentifié par clé API) ───────────────
+// ─── API Webhooks (auto-service tenant — JWT ou clé API) ─────────────────────
 
 export const webhookApi = {
     /** GET /api/v1/admin/webhooks — Lister les webhooks du tenant */
-    list: () => getDev<WebhookEndpointResponse[]>("/api/v1/admin/webhooks"),
+    list: () => get<WebhookEndpointResponse[]>("/api/v1/admin/webhooks"),
 
     /** POST /api/v1/admin/webhooks — Créer un webhook (secret affiché une seule fois) */
     create: (data: CreateWebhookEndpointRequest) =>
-        postDev<WebhookEndpointResponse>("/api/v1/admin/webhooks", data),
+        post<WebhookEndpointResponse>("/api/v1/admin/webhooks", data),
 
     /** PATCH /api/v1/admin/webhooks/{id} — Mettre à jour un webhook */
     update: (id: string, data: UpdateWebhookEndpointRequest) =>
-        patchDev<WebhookEndpointResponse>(`/api/v1/admin/webhooks/${id}`, data),
+        patch<WebhookEndpointResponse>(`/api/v1/admin/webhooks/${id}`, data),
 
     /** DELETE /api/v1/admin/webhooks/{id} — Supprimer un webhook */
-    remove: (id: string) =>
-        requestDev<void>("DELETE", `/api/v1/admin/webhooks/${id}`),
+    remove: (id: string) => del<void>(`/api/v1/admin/webhooks/${id}`),
 
     /** POST /api/v1/admin/webhooks/{id}/rotate-secret — Régénérer le secret */
     rotateSecret: (id: string) =>
-        postDev<WebhookEndpointResponse>(`/api/v1/admin/webhooks/${id}/rotate-secret`, {}),
+        post<WebhookEndpointResponse>(`/api/v1/admin/webhooks/${id}/rotate-secret`, {}),
 
     /** POST /api/v1/admin/webhooks/{id}/test — Envoyer un ping de test */
     sendTestPing: (id: string) =>
-        postDev<TestPingResponse>(`/api/v1/admin/webhooks/${id}/test`, {}),
+        post<TestPingResponse>(`/api/v1/admin/webhooks/${id}/test`, {}),
 
     /** GET /api/v1/admin/webhooks/deliveries?page=&size= — Journal des livraisons */
     listDeliveries: (page = 0, size = 20) =>
-        getDev<WebhookDeliveryResponse[]>(
+        get<WebhookDeliveryResponse[]>(
             `/api/v1/admin/webhooks/deliveries?page=${page}&size=${size}`
         ),
-};
-
-// ─── API Événements (Sandbox développeur — authentifié par clé API) ─────────
-
-export const devEventsApi = {
-    /** POST /api/v1/events — Envoyer un événement de test depuis le Sandbox (X-Api-Key) */
-    processEvent: (data: IncomingEventRequest) =>
-        postDev<EventProcessingResponse>("/api/v1/events", data),
 };
 
 // ─── Types Annuaire Membres / Politique de Tier / Journal (Admin) ────────────
